@@ -1,0 +1,78 @@
+name: Build native preview packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact private source commit to build
+        required: true
+        type: string
+      release_tag:
+        description: Existing draft release tag that receives the packages
+        required: true
+        type: string
+      run_tests:
+        description: Run the full suite before building
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: Linux-x86_64
+          - runner: macos-15
+            label: macOS-arm64
+          - runner: macos-15-intel
+            label: macOS-x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: source
+    env:
+      QT_QPA_PLATFORM: offscreen
+      SHINY_TRACKER_UPDATE: "0"
+    steps:
+      - name: Check out tested source commit
+        uses: actions/checkout@v4
+        with:
+          repository: KaizenMMO/ShinyTrackerOverlay
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SHINYTRACKER_SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            source/requirements.txt
+            source/requirements-dev.txt
+      - name: Install system OCR on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng libegl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+      - name: Install system OCR on macOS
+        if: runner.os == 'macOS'
+        run: brew install tesseract
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Test
+        if: ${{ inputs.run_tests }}
+        run: python -m unittest discover -s tests
+      - name: Build and smoke-test frozen app
+        run: python tools/build_unix.py
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: gh release upload "$RELEASE_TAG" dist/release/ShinyTrackerOverlay-* --repo KaizenMMO/shinytracker-builds
