@@ -37,6 +37,11 @@ on:
         required: false
         default: true
         type: boolean
+      tests_only:
+        description: Stop after the tests (diagnosis; touches no release)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -48,7 +53,9 @@ concurrency:
 jobs:
   linux:
     runs-on: ubuntu-22.04
-    timeout-minutes: 75
+    # A HANG MUST NOT RUN FOR HOURS. A healthy run is ~15 min; every long step
+    # below also has its own limit, so a hang fails in the step that hung.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: source
@@ -104,11 +111,20 @@ jobs:
             || { echo "::error::$RELEASE_TAG has no manifest.json; publish the Windows build first"; exit 1; }
           echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Test
-        if: ${{ inputs.run_tests }}
-        run: python -m unittest discover -s tests
+        if: ${{ inputs.run_tests || inputs.tests_only }}
+        # -v names every test as it starts, so a hang's last line is the test.
+        # At 15 min `timeout` sends SIGABRT, which faulthandler (-X faulthandler)
+        # turns into a dump of EVERY thread's stack before the process dies;
+        # -k sends SIGKILL 30 s later if even that is stuck. The step limit is
+        # the backstop behind both. The suite takes ~8 min on Windows.
+        timeout-minutes: 20
+        run: timeout -k 30s -s ABRT 15m python -X faulthandler -m unittest discover -s tests -v
       - name: Build and smoke-test the frozen app
+        if: ${{ !inputs.tests_only }}
+        timeout-minutes: 20
         run: python tools/build_unix.py
       - name: Package under the permanent name
+        if: ${{ !inputs.tests_only }}
         run: |
           cd dist/release
           cp "ShinyTrackerOverlay-$VERSION-Linux-x86_64.tar.gz" "$STABLE_NAME"
@@ -116,6 +132,8 @@ jobs:
           cat "$STABLE_NAME.sha256"
           ls -l "$STABLE_NAME"
       - name: Attach to the release and verify the public download
+        if: ${{ !inputs.tests_only }}
+        timeout-minutes: 10
         run: |
           gh release upload "$RELEASE_TAG" "dist/release/$STABLE_NAME" "dist/release/$STABLE_NAME.sha256" \
             --clobber --repo "$GITHUB_REPOSITORY"
@@ -124,6 +142,8 @@ jobs:
           cmp "$RUNNER_TEMP/public.tar.gz" "dist/release/$STABLE_NAME"
           echo "PACKAGE_URL=$url" >> "$GITHUB_ENV"
       - name: Add the linux entry to manifest.json
+        if: ${{ !inputs.tests_only }}
+        timeout-minutes: 10
         # The package goes up first and the manifest last, as in
         # publish_release.py: a client must never be told about a file that
         # is not there yet.
@@ -145,6 +165,8 @@ jobs:
           PY
           gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/manifest/manifest.json" --clobber --repo "$GITHUB_REPOSITORY"
       - name: Verify what clients will read
+        if: ${{ !inputs.tests_only }}
+        timeout-minutes: 10
         run: |
           curl -fsSL -H 'Cache-Control: no-cache' \
             "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json?verify=$(date +%s)" \
