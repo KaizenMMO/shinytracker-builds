@@ -164,6 +164,35 @@ jobs:
           print(json.dumps(manifest, indent=2))
           PY
           gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/manifest/manifest.json" --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Add the Linux instructions to the release notes
+        if: ${{ !inputs.tests_only }}
+        timeout-minutes: 5
+        # Between markers, so a re-run REPLACES the section rather than adding
+        # a second one. The full instructions are README-LINUX.txt, which is
+        # inside the download itself.
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > "$RUNNER_TEMP/body.md"
+          python - "$RUNNER_TEMP/body.md" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          body = open(path, encoding="utf-8").read()
+          start, end = "<!-- linux-start -->", "<!-- linux-end -->"
+          body = re.sub(re.escape(start) + r".*?" + re.escape(end), "", body, flags=re.S).rstrip()
+          section = f"""{start}
+          ## Linux
+
+          **[Download for Linux (x86-64)](https://github.com/KaizenMMO/shinytracker-builds/releases/latest/download/ShinyTrackerOverlay-Linux-x86_64.tar.gz)**, always the newest version.
+
+          1. Use an **X11** session, not Wayland: the tracker cannot see the screen on Wayland. Check with `echo $XDG_SESSION_TYPE`.
+          2. Extract it (`tar -xzf ShinyTrackerOverlay-Linux-x86_64.tar.gz`) and run `ShinyTrackerOverlay/ShinyTrackerOverlay`.
+          3. If Tesseract is missing, the app shows the install command for your system with a Copy button.
+
+          Full instructions and troubleshooting are in `README-LINUX.txt` inside the download.
+          {end}"""
+          open(path, "w", encoding="utf-8").write(body + "\n\n" + section + "\n")
+          PY
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/body.md"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body | grep -c "linux-start" | grep -qx 1
       - name: Verify what clients will read
         if: ${{ !inputs.tests_only }}
         timeout-minutes: 10
