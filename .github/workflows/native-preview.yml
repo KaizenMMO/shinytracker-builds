@@ -46,7 +46,7 @@ jobs:
         with:
           repository: KaizenMMO/ShinyTrackerOverlay
           ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SHINYTRACKER_SOURCE_TOKEN }}
+          ssh-key: ${{ secrets.SHINYTRACKER_SOURCE_SSH_KEY }}
           path: source
           persist-credentials: false
       - uses: actions/setup-python@v5

@@ -1,0 +1,158 @@
+name: Linux release package
+
+# Builds the Linux package for a PUBLISHED release and attaches it to that same
+# release, so every version ships Linux beside the Windows ZIP.
+#
+# Started automatically by the source repo's packaging/publish_release.py after
+# each Windows publish. By hand:
+#
+#   gh workflow run linux-release.yml --repo KaizenMMO/shinytracker-builds \
+#     -f source_sha=<pushed commit in ShinyTrackerOverlay> -f release_tag=v3.8
+#
+# What it leaves on the release:
+#   ShinyTrackerOverlay-Linux-x86_64.tar.gz (+ .sha256) -- ONE FIXED NAME, so
+#     releases/latest/download/ShinyTrackerOverlay-Linux-x86_64.tar.gz
+#     is a permanent link to the newest Linux build.
+#   manifest.json gains a "linux" entry. Linux copies of the app read only that
+#     entry; Windows clients read the top level, which is left untouched.
+#
+# Free: this repo is public, and public repos do not use Actions minutes.
+# Built on ubuntu-22.04 on purpose: a PyInstaller build only runs on systems
+# with the build host's glibc or newer, and 22.04's (2.35) is older than every
+# current mainstream desktop distribution.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact ShinyTrackerOverlay commit (must be pushed)
+        required: true
+        type: string
+      release_tag:
+        description: Published release tag to attach to, e.g. v3.8
+        required: true
+        type: string
+      run_tests:
+        description: Run the full suite before building
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: source
+    env:
+      QT_QPA_PLATFORM: offscreen
+      SHINY_TRACKER_UPDATE: "0"
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      STABLE_NAME: ShinyTrackerOverlay-Linux-x86_64.tar.gz
+    steps:
+      - name: Check out the source commit
+        uses: actions/checkout@v4
+        with:
+          repository: KaizenMMO/ShinyTrackerOverlay
+          ref: ${{ inputs.source_sha }}
+          # A READ-ONLY deploy key on ShinyTrackerOverlay: reads that one
+          # repo, cannot push, does not expire. See README for its setup.
+          ssh-key: ${{ secrets.SHINYTRACKER_SOURCE_SSH_KEY }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            source/requirements.txt
+            source/requirements-dev.txt
+      - name: Install system libraries and Tesseract
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng libegl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+      - name: Install Python dependencies
+        # RapidOCR is installed --no-deps, exactly as on Windows: it declares
+        # the GUI opencv-python, which must not sit beside the headless one.
+        run: |
+          grep -v '^rapidocr' requirements.txt > "$RUNNER_TEMP/requirements.txt"
+          python -m pip install -r "$RUNNER_TEMP/requirements.txt" -r requirements-dev.txt
+          python -m pip install --no-deps "$(grep -E '^rapidocr_onnxruntime==' requirements.txt | cut -d';' -f1 | tr -d ' ')"
+          python -c "import cv2, rapidocr_onnxruntime, onnxruntime; print('cv2', cv2.__version__)"
+      - name: Check the release matches this source
+        run: |
+          version=$(python -c "from src.app_info import APP_VERSION; print(APP_VERSION)")
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::Source is v$version but the release tag is $RELEASE_TAG"
+            exit 1
+          fi
+          state=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease -q '"\(.isDraft) \(.isPrerelease)"')
+          if [ "$state" != "false false" ]; then
+            echo "::error::$RELEASE_TAG must be a published, non-prerelease release (draft prerelease: $state)"
+            exit 1
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx manifest.json \
+            || { echo "::error::$RELEASE_TAG has no manifest.json; publish the Windows build first"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Test
+        if: ${{ inputs.run_tests }}
+        run: python -m unittest discover -s tests
+      - name: Build and smoke-test the frozen app
+        run: python tools/build_unix.py
+      - name: Package under the permanent name
+        run: |
+          cd dist/release
+          cp "ShinyTrackerOverlay-$VERSION-Linux-x86_64.tar.gz" "$STABLE_NAME"
+          sha256sum "$STABLE_NAME" > "$STABLE_NAME.sha256"
+          cat "$STABLE_NAME.sha256"
+          ls -l "$STABLE_NAME"
+      - name: Attach to the release and verify the public download
+        run: |
+          gh release upload "$RELEASE_TAG" "dist/release/$STABLE_NAME" "dist/release/$STABLE_NAME.sha256" \
+            --clobber --repo "$GITHUB_REPOSITORY"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$STABLE_NAME"
+          curl -fsSL -H 'Cache-Control: no-cache' "$url?verify=$(date +%s)" -o "$RUNNER_TEMP/public.tar.gz"
+          cmp "$RUNNER_TEMP/public.tar.gz" "dist/release/$STABLE_NAME"
+          echo "PACKAGE_URL=$url" >> "$GITHUB_ENV"
+      - name: Add the linux entry to manifest.json
+        # The package goes up first and the manifest last, as in
+        # publish_release.py: a client must never be told about a file that
+        # is not there yet.
+        run: |
+          mkdir -p "$RUNNER_TEMP/manifest"
+          gh release download "$RELEASE_TAG" -p manifest.json -D "$RUNNER_TEMP/manifest" --clobber --repo "$GITHUB_REPOSITORY"
+          python - "$RUNNER_TEMP/manifest/manifest.json" "dist/release/$STABLE_NAME" <<'PY'
+          import hashlib, json, os, sys
+          manifest_path, package = sys.argv[1], sys.argv[2]
+          manifest = json.load(open(manifest_path, encoding="utf-8"))
+          version = os.environ["VERSION"]
+          if manifest.get("version") != version:
+              sys.exit(f"manifest.json is v{manifest.get('version')}, not v{version}")
+          digest = hashlib.sha256(open(package, "rb").read()).hexdigest()
+          manifest["linux"] = {"version": version, "url": os.environ["PACKAGE_URL"],
+                               "sha256": digest, "size": os.path.getsize(package)}
+          json.dump(manifest, open(manifest_path, "w", encoding="utf-8"), indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/manifest/manifest.json" --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Verify what clients will read
+        run: |
+          curl -fsSL -H 'Cache-Control: no-cache' \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json?verify=$(date +%s)" \
+            | python -c "import json,sys; m=json.load(sys.stdin); assert m['linux']['version']==m['version'], m; print('manifest ok:', m['version'], m['linux']['url'])"
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          if [ "$latest" = "$RELEASE_TAG" ]; then
+            curl -fsSIL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$STABLE_NAME" | grep -i '^location' | tail -1
+            echo "Permanent link serves $RELEASE_TAG"
+          else
+            echo "::warning::$RELEASE_TAG is not the latest release ($latest), so the permanent link does not serve it"
+          fi
