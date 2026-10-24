@@ -42,6 +42,11 @@ on:
         required: false
         default: false
         type: boolean
+      test_build:
+        description: Tester build - attach only to a PRE-release tag (e.g. linux-test); no manifest, no notes
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -98,6 +103,18 @@ jobs:
       - name: Check the release matches this source
         run: |
           version=$(python -c "from src.app_info import APP_VERSION; print(APP_VERSION)")
+          # A TESTER BUILD (one player trying an unreleased fix) goes to a
+          # pre-release and nowhere else: no manifest entry, so no installed
+          # copy is ever offered it, and the permanent link never serves it.
+          if [ "${{ inputs.test_build }}" = "true" ]; then
+            pre=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
+            if [ "$pre" != "true" ]; then
+              echo "::error::test builds attach only to a pre-release; $RELEASE_TAG is not one"
+              exit 1
+            fi
+            echo "VERSION=$version" >> "$GITHUB_ENV"
+            exit 0
+          fi
           if [ "$RELEASE_TAG" != "v$version" ]; then
             echo "::error::Source is v$version but the release tag is $RELEASE_TAG"
             exit 1
@@ -142,7 +159,7 @@ jobs:
           cmp "$RUNNER_TEMP/public.tar.gz" "dist/release/$STABLE_NAME"
           echo "PACKAGE_URL=$url" >> "$GITHUB_ENV"
       - name: Add the linux entry to manifest.json
-        if: ${{ !inputs.tests_only }}
+        if: ${{ !inputs.tests_only && !inputs.test_build }}
         timeout-minutes: 10
         # The package goes up first and the manifest last, as in
         # publish_release.py: a client must never be told about a file that
@@ -165,7 +182,7 @@ jobs:
           PY
           gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/manifest/manifest.json" --clobber --repo "$GITHUB_REPOSITORY"
       - name: Add the Linux instructions to the release notes
-        if: ${{ !inputs.tests_only }}
+        if: ${{ !inputs.tests_only && !inputs.test_build }}
         timeout-minutes: 5
         # Between markers, so a re-run REPLACES the section rather than adding
         # a second one. The full instructions are README-LINUX.txt, which is
@@ -194,7 +211,7 @@ jobs:
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/body.md"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body | grep -c "linux-start" | grep -qx 1
       - name: Verify what clients will read
-        if: ${{ !inputs.tests_only }}
+        if: ${{ !inputs.tests_only && !inputs.test_build }}
         timeout-minutes: 10
         run: |
           curl -fsSL -H 'Cache-Control: no-cache' \
