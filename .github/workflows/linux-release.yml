@@ -103,6 +103,10 @@ jobs:
       - name: Check the release matches this source
         run: |
           version=$(python -c "from src.app_info import APP_VERSION; print(APP_VERSION)")
+          if [ "${{ inputs.tests_only }}" = "true" ]; then
+            echo "VERSION=$version" >> "$GITHUB_ENV"
+            exit 0
+          fi
           # A TESTER BUILD (one player trying an unreleased fix) goes to a
           # pre-release and nowhere else: no manifest entry, so no installed
           # copy is ever offered it, and the permanent link never serves it.
