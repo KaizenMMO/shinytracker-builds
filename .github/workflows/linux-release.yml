@@ -136,6 +136,22 @@ jobs:
         # the backstop behind both. The suite takes ~8 min on Windows.
         timeout-minutes: 20
         run: timeout -k 30s -s ABRT 15m python -X faulthandler -m unittest discover -s tests -v
+      - name: Game-window capture on a real X server (the Wayland path)
+        # On Wayland the tracker reads the game's X11 windows instead of the
+        # black screen (src/capture/x11_windows.py). The suite above runs Qt
+        # offscreen, which skips that test; here it runs against Xvfb with a
+        # window manager (openbox publishes the window lists like KWin does).
+        if: ${{ inputs.run_tests || inputs.tests_only }}
+        timeout-minutes: 10
+        run: |
+          sudo apt-get install -y xvfb openbox libxcomposite1 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xfixes0
+          xvfb-run -a -s "-screen 0 1280x960x24 +extension Composite" bash -c '
+            openbox & sleep 2
+            QT_QPA_PLATFORM=xcb python -m unittest -v tests.test_x11_window_capture_live' 2>&1 | tee "$RUNNER_TEMP/live.txt"
+          grep -q "^OK" "$RUNNER_TEMP/live.txt"
+          if grep -q "skipped" "$RUNNER_TEMP/live.txt"; then echo "::error::live X test was skipped"; exit 1; fi
       - name: Build and smoke-test the frozen app
         if: ${{ !inputs.tests_only }}
         timeout-minutes: 20
@@ -164,7 +180,11 @@ jobs:
         # The package goes up first and the manifest last, as in
         # publish_release.py: a client must never be told about a file that
         # is not there yet.
+        # The Linux and Mac workflows both edit manifest.json, minutes apart.
+        # Each re-reads the newest manifest right before writing (keeping the
+        # other's entry) and checks afterwards that its own entry survived.
         run: |
+          for attempt in 1 2 3 4 5; do
           mkdir -p "$RUNNER_TEMP/manifest"
           gh release download "$RELEASE_TAG" -p manifest.json -D "$RUNNER_TEMP/manifest" --clobber --repo "$GITHUB_REPOSITORY"
           python - "$RUNNER_TEMP/manifest/manifest.json" "dist/release/$STABLE_NAME" <<'PY'
@@ -181,6 +201,16 @@ jobs:
           print(json.dumps(manifest, indent=2))
           PY
           gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/manifest/manifest.json" --clobber --repo "$GITHUB_REPOSITORY"
+          sleep 30
+          rm -rf "$RUNNER_TEMP/check" && mkdir -p "$RUNNER_TEMP/check"
+          gh release download "$RELEASE_TAG" -p manifest.json -D "$RUNNER_TEMP/check" --clobber --repo "$GITHUB_REPOSITORY"
+          if python -c "import json,sys,os; m=json.load(open(sys.argv[1])); sys.exit(0 if m.get('linux',{}).get('version')==os.environ['VERSION'] else 1)" "$RUNNER_TEMP/check/manifest.json"; then
+            exit 0
+          fi
+          echo "::warning::manifest lost the linux entry (attempt $attempt); retrying"
+          done
+          echo "::error::could not keep the linux entry in manifest.json"
+          exit 1
       - name: Add the Linux instructions to the release notes
         if: ${{ !inputs.tests_only && !inputs.test_build }}
         timeout-minutes: 5
@@ -188,6 +218,7 @@ jobs:
         # a second one. The full instructions are README-LINUX.txt, which is
         # inside the download itself.
         run: |
+          for attempt in 1 2 3 4; do
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > "$RUNNER_TEMP/body.md"
           python - "$RUNNER_TEMP/body.md" <<'PY'
           import re, sys
@@ -200,7 +231,7 @@ jobs:
 
           **[Download for Linux (x86-64)](https://github.com/KaizenMMO/shinytracker-builds/releases/latest/download/ShinyTrackerOverlay-Linux-x86_64.tar.gz)**, always the newest version.
 
-          1. Use an **X11** session, not Wayland: the tracker cannot see the screen on Wayland. Check with `echo $XDG_SESSION_TYPE`.
+          1. X11 or Wayland. On Wayland the tracker reads the game windows themselves; keep the game open, not minimised.
           2. Extract it (`tar -xzf ShinyTrackerOverlay-Linux-x86_64.tar.gz`) and run `ShinyTrackerOverlay/ShinyTrackerOverlay`.
           3. If Tesseract is missing, the app shows the install command for your system with a Copy button.
 
@@ -209,7 +240,14 @@ jobs:
           open(path, "w", encoding="utf-8").write(body + "\n\n" + section + "\n")
           PY
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/body.md"
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body | grep -c "linux-start" | grep -qx 1
+          sleep 30
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body | grep -c "linux-start" | grep -qx 1; then
+            exit 0
+          fi
+          echo "::warning::release notes lost the section (attempt $attempt); retrying"
+          done
+          echo "::error::could not keep the release-notes section"
+          exit 1
       - name: Verify what clients will read
         if: ${{ !inputs.tests_only && !inputs.test_build }}
         timeout-minutes: 10
